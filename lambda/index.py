@@ -1,111 +1,73 @@
 # lambda/index.py
 import json
 import os
-import boto3
-import re  # 正規表現モジュールをインポート
-from botocore.exceptions import ClientError
+import requests # boto3, re, ClientError を削除し、requests をインポート
+from typing import List, Dict, Any
 
+# FastAPIエンドポイントのURLを環境変数から取得
+# デプロイ時に環境変数を設定する必要があります
+INFERENCE_API_ENDPOINT = os.environ.get("INFERENCE_API_ENDPOINT")
 
-# Lambda コンテキストからリージョンを抽出する関数
-def extract_region_from_arn(arn):
-    # ARN 形式: arn:aws:lambda:region:account-id:function:function-name
-    match = re.search('arn:aws:lambda:([^:]+):', arn)
-    if match:
-        return match.group(1)
-    return "us-east-1"  # デフォルト値
-
-# グローバル変数としてクライアントを初期化（初期値）
-bedrock_client = None
-
-# モデルID
-MODEL_ID = os.environ.get("MODEL_ID", "us.amazon.nova-lite-v1:0")
+# Bedrockクライアントの初期化とリージョン抽出関数は不要なので削除
+# MODEL_ID は FastAPI 側で管理するため削除
 
 def lambda_handler(event, context):
+    """
+    API Gatewayからのリクエストを処理し、FastAPIエンドポイントに推論を依頼するLambda関数。
+
+    Args:
+        event: API Gatewayからのイベントデータ。
+        context: Lambda実行コンテキスト。
+
+    Returns:
+        API Gatewayに返すレスポンス。
+    """
     try:
-        # コンテキストから実行リージョンを取得し、クライアントを初期化
-        global bedrock_client
-        if bedrock_client is None:
-            region = extract_region_from_arn(context.invoked_function_arn)
-            bedrock_client = boto3.client('bedrock-runtime', region_name=region)
-            print(f"Initialized Bedrock client in region: {region}")
-        
         print("Received event:", json.dumps(event))
-        
-        # Cognitoで認証されたユーザー情報を取得
+
+        if not INFERENCE_API_ENDPOINT:
+            raise ValueError("INFERENCE_API_ENDPOINT environment variable is not set.")
+
+        # Cognitoで認証されたユーザー情報を取得 (オプション)
         user_info = None
         if 'requestContext' in event and 'authorizer' in event['requestContext']:
             user_info = event['requestContext']['authorizer']['claims']
             print(f"Authenticated user: {user_info.get('email') or user_info.get('cognito:username')}")
-        
+
         # リクエストボディの解析
         body = json.loads(event['body'])
         message = body['message']
         conversation_history = body.get('conversationHistory', [])
-        
-        print("Processing message:", message)
-        print("Using model:", MODEL_ID)
-        
-        # 会話履歴を使用
-        messages = conversation_history.copy()
-        
-        # ユーザーメッセージを追加
-        messages.append({
-            "role": "user",
-            "content": message
-        })
-        
-        # Nova Liteモデル用のリクエストペイロードを構築
-        # 会話履歴を含める
-        bedrock_messages = []
-        for msg in messages:
-            if msg["role"] == "user":
-                bedrock_messages.append({
-                    "role": "user",
-                    "content": [{"text": msg["content"]}]
-                })
-            elif msg["role"] == "assistant":
-                bedrock_messages.append({
-                    "role": "assistant", 
-                    "content": [{"text": msg["content"]}]
-                })
-        
-        # invoke_model用のリクエストペイロード
-        request_payload = {
-            "messages": bedrock_messages,
-            "inferenceConfig": {
-                "maxTokens": 512,
-                "stopSequences": [],
-                "temperature": 0.7,
-                "topP": 0.9
-            }
+
+        print("Sending message to inference API:", message)
+
+        # FastAPIエンドポイントへのリクエストペイロードを作成
+        api_payload = {
+            "message": message,
+            "conversationHistory": conversation_history
         }
-        
-        print("Calling Bedrock invoke_model API with payload:", json.dumps(request_payload))
-        
-        # invoke_model APIを呼び出し
-        response = bedrock_client.invoke_model(
-            modelId=MODEL_ID,
-            body=json.dumps(request_payload),
-            contentType="application/json"
-        )
-        
-        # レスポンスを解析
-        response_body = json.loads(response['body'].read())
-        print("Bedrock response:", json.dumps(response_body, default=str))
-        
-        # 応答の検証
-        if not response_body.get('output') or not response_body['output'].get('message') or not response_body['output']['message'].get('content'):
-            raise Exception("No response content from the model")
-        
-        # アシスタントの応答を取得
-        assistant_response = response_body['output']['message']['content'][0]['text']
-        
-        # アシスタントの応答を会話履歴に追加
-        messages.append({
-            "role": "assistant",
-            "content": assistant_response
-        })
-        
+
+        print("Calling Inference API endpoint:", INFERENCE_API_ENDPOINT)
+
+        # FastAPIエンドポイントを呼び出し
+        response = requests.post(INFERENCE_API_ENDPOINT, json=api_payload)
+        response.raise_for_status() # HTTPエラーがあれば例外を発生させる
+
+        # FastAPIからのレスポンスを解析
+        api_response = response.json()
+        print("Inference API response:", json.dumps(api_response))
+
+        if not api_response.get("success"):
+            error_message = api_response.get("error", "Inference API returned an error.")
+            raise Exception(error_message)
+
+        # アシスタントの応答と会話履歴を取得
+        assistant_response = api_response.get("response")
+        updated_history = api_response.get("conversationHistory")
+
+        if assistant_response is None or updated_history is None:
+            raise Exception("Invalid response structure from Inference API.")
+
         # 成功レスポンスの返却
         return {
             "statusCode": 200,
@@ -118,13 +80,28 @@ def lambda_handler(event, context):
             "body": json.dumps({
                 "success": True,
                 "response": assistant_response,
-                "conversationHistory": messages
+                "conversationHistory": updated_history
             })
         }
-        
+
+    except requests.exceptions.RequestException as http_error:
+        print(f"HTTP Error calling Inference API: {http_error}")
+        return {
+            "statusCode": 502, # Bad Gateway
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
+                "Access-Control-Allow-Methods": "OPTIONS,POST"
+            },
+            "body": json.dumps({
+                "success": False,
+                "error": f"Failed to connect to inference service: {http_error}"
+            })
+        }
+
     except Exception as error:
-        print("Error:", str(error))
-        
+        print(f"Error: {error}")
         return {
             "statusCode": 500,
             "headers": {
